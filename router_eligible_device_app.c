@@ -35,6 +35,8 @@ Include Files
 #include "thread_network.h"
 #include "thread_app_callbacks.h"
 #include "thread_attributes.h"
+#include "thread_types.h"  // Para thrDeviceDescriptor_t
+#include "thread_utils.h"  // Para THR_GetLeaderDescriptor
 
 #include "app_init.h"
 #include "app_stack_config.h"
@@ -43,18 +45,6 @@ Include Files
 #include "app_temp_sensor.h"
 #include "coap.h"
 #include "app_socket_utils.h"
-
-#include "fsl_debug_console.h"
-#include "board.h"
-#include "math.h"
-#include "fsl_fxos.h"
-#include "fsl_i2c.h"
-#include "fsl_tpm.h"
-
-#include "clock_config.h"
-#include "pin_mux.h"
-#include "fsl_gpio.h"
-#include "fsl_port.h"
 #if THR_ENABLE_EVENT_MONITORING
 #include "app_event_monitoring.h"
 #endif
@@ -88,13 +78,18 @@ Private macros
 
 #define gAppJoinTimeout_c                       800    /* miliseconds */
 
+#define TEAM3_REQUEST_INTERVAL_MS    			2000  	// 2 segundos
+
+
 #define APP_LED_URI_PATH                        "/led"
 #define APP_TEMP_URI_PATH                       "/temp"
 #define APP_SINK_URI_PATH                       "/sink"
 
-#define APP_RESOURCE1_URI_PATH                       "/resource1"
+#define APP_RESOURCE1_URI_PATH                       	"/resource1"
+#define APP_RESOURCE2_URI_PATH                      	"/resource2"
+#define APP_TEAM3_URI_PATH                       		"/team3"
 
-#define APP_RESOURCE2_URI_PATH                       "/resource2"
+// Recurso para el timer
 
 #if LARGE_NETWORK
 #define APP_RESET_TO_FACTORY_URI_PATH           "/reset"
@@ -105,42 +100,16 @@ Private macros
 /*==================================================================================================
 Private type definitions
 ==================================================================================================*/
-/* The TPM instance/channel used for board */
-#define BOARD_TIMER_BASEADDR TPM2
-#define BOARD_FIRST_TIMER_CHANNEL 0U
-#define BOARD_SECOND_TIMER_CHANNEL 1U
-/* Get source clock for TPM driver */
-#define BOARD_TIMER_SOURCE_CLOCK CLOCK_GetFreq(kCLOCK_Osc0ErClk)
-#define TIMER_CLOCK_MODE 1U
-/* I2C source clock */
-#define ACCEL_I2C_CLK_SRC I2C1_CLK_SRC
-#define I2C_BAUDRATE 100000U
 
-#define I2C_RELEASE_SDA_PORT PORTC
-#define I2C_RELEASE_SCL_PORT PORTC
-#define I2C_RELEASE_SDA_GPIO GPIOC
-#define I2C_RELEASE_SDA_PIN 3U
-#define I2C_RELEASE_SCL_GPIO GPIOC
-#define I2C_RELEASE_SCL_PIN 2U
-#define I2C_RELEASE_BUS_COUNT 100U
-/* Upper bound and lower bound angle values */
-#define ANGLE_UPPER_BOUND 85U
-#define ANGLE_LOWER_BOUND 5U
-
-// Definir URI (cambia "teamX" por tu nombre de equipo)
-#define APP_TEAM_URI_PATH "/team3"
 /*==================================================================================================
 Private global variables declarations
 ==================================================================================================*/
 static instanceId_t mThrInstanceId = gInvalidInstanceId_c;    /*!< Thread Instance ID */
+
 static bool_t mFirstPushButtonPressed = FALSE;
+
 static bool_t mJoiningIsAppInitiated = FALSE;
 
-/*------------------------------------------------------------------------------------------------------*/
-const coapUriPath_t gAPP_TEAM_URI_PATH = {SizeOfString(APP_TEAM_URI_PATH), (uint8_t *)APP_TEAM_URI_PATH};
-
-static uint16_t gTeamCounter = 1;  // Contador 1-200
-static tmrTimerID_t gTeamTimer = gTmrInvalidTimerID_c;
 /*==================================================================================================
 Private prototypes
 ==================================================================================================*/
@@ -186,6 +155,9 @@ const coapUriPath_t gAPP_SINK_URI_PATH = {SizeOfString(APP_SINK_URI_PATH), (uint
 
 const coapUriPath_t gAPP_RESOURCE1_URI_PATH = {SizeOfString(APP_RESOURCE1_URI_PATH), APP_RESOURCE1_URI_PATH};
 const coapUriPath_t gAPP_RESOURCE2_URI_PATH = {SizeOfString(APP_RESOURCE2_URI_PATH), APP_RESOURCE2_URI_PATH};
+
+//URI propia
+const coapUriPath_t gAPP_TEAM3_URI_PATH = {SizeOfString(APP_TEAM3_URI_PATH), (uint8_t *)APP_TEAM3_URI_PATH};
 #if LARGE_NETWORK
 const coapUriPath_t gAPP_RESET_URI_PATH = {SizeOfString(APP_RESET_TO_FACTORY_URI_PATH), (uint8_t *)APP_RESET_TO_FACTORY_URI_PATH};
 #endif
@@ -218,41 +190,197 @@ taskMsgQueue_t *mpAppThreadMsgQueue = NULL;
 
 extern bool_t gEnable802154TxLed;
 
+/*Vairables para el contador para el Leader*/
+static uint8_t team3Counter = 1;
+static tmrTimerID_t team3TimerId = gTmrInvalidTimerID_c;
+static bool_t team3TimerRunning = FALSE;
+
+/*varibles para el contadro del ruter1*/
+static tmrTimerID_t mTeam3RequestTimerId = gTmrInvalidTimerID_c;
+static bool_t mTeam3RequestTimerRunning = FALSE;
+
 /*==================================================================================================
 Public functions
 ==================================================================================================*/
-
-static void TeamTimerCallback(void *param)
+/*####################################Funciones para el leader####################################*/
+static void Team3_SendCompleteCallback(coapSessionStatus_t status, uint8_t *pData,
+                                      coapSession_t *pSession, uint32_t dataLen)
 {
-    gTeamCounter = (gTeamCounter % 200) + 1;  // COntador de 1 a 200
+    if (status == gCoapSuccess_c)
+    {
+        COAP_CloseSession(pSession);
+    }
 }
-static void APP_CoapTeamCb(
+
+static void Team3_TimerCallback(void *param)
+{
+    if (team3Counter < 200)
+    {
+        team3Counter++;
+    } else
+    {
+        team3Counter = 1;
+    }
+    if (team3TimerRunning)
+    {
+        TMR_StartSingleShotTimer(team3TimerId, 1000, Team3_TimerCallback, NULL);
+    }
+}
+
+static void Team3_StartTimer(void)
+{
+    if (team3TimerId == gTmrInvalidTimerID_c)
+    {
+        team3TimerId = TMR_AllocateTimer();
+    }
+
+    if (team3TimerId != gTmrInvalidTimerID_c)
+    {
+        team3TimerRunning = TRUE;
+        TMR_StartSingleShotTimer(team3TimerId, 1000, Team3_TimerCallback, NULL);
+    }
+}
+
+static void Team3_StopTimer(void)
+{
+    team3TimerRunning = FALSE;
+    if (team3TimerId != gTmrInvalidTimerID_c) {
+        TMR_StopTimer(team3TimerId);
+    }
+}
+
+static void APP_CoapTeam3Cb(
     coapSessionStatus_t sessionStatus,
     uint8_t *pData,
     coapSession_t *pSession,
-    uint32_t dataLen
-)
+    uint32_t dataLen)
 {
-    char ipStr[INET6_ADDRSTRLEN];
-    ntop(AF_INET6, (ipAddr_t*)&pSession->remoteAddrStorage.ss_addr, ipStr, INET6_ADDRSTRLEN);
+    char addrStr[INET6_ADDRSTRLEN];
 
-    // Imprimir tipo de petición y dirección IP
-    PRINTF("%s instruction received from %s\n",
-           (pSession->msgType == gCoapConfirmable_c) ? "CON" : "NON",
-           ipStr);
+    // Convertir dirección IP a string
+    ntop(AF_INET6, (ipAddr_t*)&pSession->remoteAddrStorage.ss_addr, addrStr, INET6_ADDRSTRLEN);
 
-    // Responder solo si es CON
+    // Imprimir información de la solicitud
+    if (pSession->msgType == gCoapConfirmable_c)
+    {
+        shell_printf("CON instruction received from %s\r\n", addrStr);
+    } else
+    {
+        shell_printf("NON instruction received from %s\r\n", addrStr);
+    }
+
+    // Solo responder si es CON
     if (pSession->msgType == gCoapConfirmable_c) {
-        char response[16];
-        sprintf(response, "Counter: %d", gTeamCounter);
-        COAP_Send(pSession, gCoapMsgTypeAckSuccessContent_c, (uint8_t *)response, strlen(response));
+        char counterStr[4];
+        uint32_t counterLen;
+
+        // Convertir el contador a string y obtener su longitud
+        counterLen = snprintf(counterStr, sizeof(counterStr), "%d", team3Counter);
+
+        // Enviar ACK con el valor del contador
+        COAP_SetCallback(pSession, Team3_SendCompleteCallback);
+        COAP_CloseSession(pSession);
     }
 }
+
+/*####################################Funciones para el Router1####################################*/
+
+static void APP_Team3ResponseHandler(
+    coapSessionStatus_t sessionStatus,
+    uint8_t *pData,
+    coapSession_t *pSession,
+    uint32_t dataLen)
+{
+    if(sessionStatus == gCoapSuccess_c && pData && dataLen > 0)
+    {
+        char addrStr[INET6_ADDRSTRLEN];
+        ntop(AF_INET6, (ipAddr_t*)&pSession->remoteAddrStorage.ss_addr, addrStr, INET6_ADDRSTRLEN);
+
+        shell_printf("Counter = %.*s from %s type %s\r\n",
+                     dataLen, pData,
+                     addrStr,
+                     pSession->msgType == gCoapConfirmable_c ? "CON" : "NON");
+    }
+}
+
+static void APP_GetLeaderAddress(ipAddr_t *pLeaderAddr)
+{
+
+    const uint8_t leaderAloc[16] = {
+        0xfd, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0xff, 0xfe, 0x00, 0xfc
+    };
+    FLib_MemCpy(pLeaderAddr, leaderAloc, sizeof(ipAddr_t));
+}
+
+static void APP_SendTeam3Request(uint8_t *param)
+{
+    if(THR_GetAttr_DeviceRole(mThrInstanceId) != gThrDevRole_Leader_c)
+    {
+        coapSession_t *pSession = COAP_OpenSession(mAppCoapInstId);
+        if(pSession)
+        {
+            ipAddr_t leaderAddr;
+
+            APP_GetLeaderAddress(&leaderAddr);
+
+            pSession->pCallback = APP_Team3ResponseHandler;
+            FLib_MemCpy(&pSession->remoteAddrStorage.ss_addr, &leaderAddr, sizeof(ipAddr_t));
+            pSession->pUriPath = (coapUriPath_t *)&gAPP_TEAM3_URI_PATH;
+
+            static bool_t useCon = TRUE;
+            pSession->msgType = useCon ? gCoapConfirmable_c : gCoapNonConfirmable_c;
+            useCon = !useCon;
+
+            COAP_Send(pSession, gCoapMsgTypeNonGet_c, NULL, 0);
+            COAP_CloseSession(pSession);
+            char addrStr[INET6_ADDRSTRLEN];
+            ntop(AF_INET6, &leaderAddr, addrStr, INET6_ADDRSTRLEN);
+            shell_printf("Sent %s request to Leader at %s for Team3 counter\r\n",
+                         pSession->msgType == gCoapConfirmable_c ? "CON" : "NON",
+                         addrStr);
+        }
+    }
+}
+
+
+static void APP_StartTeam3Requests(void)
+{
+    if(mTeam3RequestTimerId == gTmrInvalidTimerID_c)
+    {
+        mTeam3RequestTimerId = TMR_AllocateTimer();
+    }
+
+    if(mTeam3RequestTimerId != gTmrInvalidTimerID_c)
+    {
+        mTeam3RequestTimerRunning = TRUE;
+        TMR_StartIntervalTimer(mTeam3RequestTimerId,
+                              TEAM3_REQUEST_INTERVAL_MS,
+                              APP_SendTeam3Request,
+                              NULL);
+    }
+}
+
+static void APP_StopTeam3Requests(void)
+{
+    mTeam3RequestTimerRunning = FALSE;
+    if(mTeam3RequestTimerId != gTmrInvalidTimerID_c)
+    {
+        TMR_StopTimer(mTeam3RequestTimerId);
+        TMR_FreeTimer(mTeam3RequestTimerId); // Liberar el timer
+    }
+}
+
 /*!*************************************************************************************************
 \fn     void APP_Init(void)
 \brief  This function is used to initialize application.
 ***************************************************************************************************/
-void APP_Init(void)
+void APP_Init
+(
+    void
+)
 {
     /* Initialize pointer to application task message queue */
     mpAppThreadMsgQueue = &appThreadMsgQueue;
@@ -270,11 +398,6 @@ void APP_Init(void)
     /* Use one instance ID for application */
     mThrInstanceId = gThrDefaultInstanceId_c;
 
-
-    /*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%*/
-    //Timer
-    gTeamTimer = TMR_AllocateTimer();
-    TMR_StartIntervalTimer(gTeamTimer, 1000, TeamTimerCallback, NULL);  // 1 segundo
 #if THR_ENABLE_EVENT_MONITORING
     /* Initialize event monitoring */
     APP_InitEventMonitor(mThrInstanceId);
@@ -367,10 +490,7 @@ void APP_NwkScanHandler
 
 \param  [in]    param    Pointer to stack event
 ***************************************************************************************************/
-void Stack_to_APP_Handler
-(
-    void *param
-)
+void Stack_to_APP_Handler(void *param)
 {
     thrEvmParams_t *pEventParams = (thrEvmParams_t *)param;
 
@@ -407,6 +527,11 @@ void Stack_to_APP_Handler
             gEnable802154TxLed = TRUE;
             /* Uncomment to register multicast address */
             //IP_IF_AddMulticastGroup6(gIpIfSlp0_c, &mCastGroup);
+            // Iniciar solicitudes periódicas si no somos el líder
+			if(THR_GetAttr_DeviceRole(mThrInstanceId) != gThrDevRole_Leader_c)
+			{
+				APP_StartTeam3Requests();
+			}
             break;
 
         case gThrEv_GeneralInd_RequestRouterId_c:
@@ -426,11 +551,14 @@ void Stack_to_APP_Handler
         case gThrEv_GeneralInd_Disconnected_c:
             APP_SetMode(mThrInstanceId, gDeviceMode_Configuration_c);
             App_UpdateStateLeds(gDeviceState_NwkFailure_c);
+            Team3_StopTimer();
+            APP_StopTeam3Requests();
             break;
 
         case gThrEv_GeneralInd_DeviceIsLeader_c:
             App_UpdateStateLeds(gDeviceState_Leader_c);
             gEnable802154TxLed = TRUE;
+            Team3_StartTimer();
 #if !LARGE_NETWORK
             /* Auto start commissioner for the partition for demo purposes */
             MESHCOP_StartCommissioner(pEventParams->thrInstId);
@@ -568,7 +696,7 @@ static void APP_InitCoapDemo
                                      {APP_CoapTempCb, (coapUriPath_t *)&gAPP_TEMP_URI_PATH},
 									 {APP_CoapSinkCb, (coapUriPath_t *)&gAPP_RESOURCE2_URI_PATH},
 									 {APP_CoapSinkCb, (coapUriPath_t *)&gAPP_SINK_URI_PATH},
-									 {APP_CoapTeamCb, (coapUriPath_t *)&gAPP_TEAM_URI_PATH}};
+									 {APP_CoapTeam3Cb, (coapUriPath_t *)&gAPP_TEAM3_URI_PATH}};
 #if LARGE_NETWORK
                                      {APP_CoapResetToFactoryDefaultsCb, (coapUriPath_t *)&gAPP_RESET_URI_PATH},
 #endif
